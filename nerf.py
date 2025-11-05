@@ -1,186 +1,344 @@
+import os
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.data import DataLoader
 import numpy as np
+import random
+from dataset import *
+from helpers import *
+from torchsummary import summary
+
+class Embedder:
+    def __init__(self, multires, input_dims=3):
+        self.embed_fns = []
+        self.out_dim = 0
+
+        self.embed_fns.append(lambda x: x)
+        self.out_dim += input_dims
+
+        num_freq = multires
+        max_freq_log2 = multires - 1
+        freq_bands = 2 ** torch.linspace(0, max_freq_log2, num_freq)
+        for freq in freq_bands:
+            for fn in [torch.sin, torch.cos]:
+                self.embed_fns.append(lambda x, pfn=fn, freq=freq: pfn(x * freq))
+                self.out_dim += input_dims
+    
+    def embed(self, inputs):
+        return torch.cat([fn(inputs) for fn in self.embed_fns], dim=-1)
 
 
 class NeRF_Model(nn.Module):
     def __init__(
             self,
             layer_depth=8,
-            layer_width=256,
-            num_input_channel=3,
-            num_input_channel_views=2):
+            layer_width=128,
+            num_input_channels=3,
+            num_input_view_channels=3,
+            pts_embed_multires=10,
+            view_embed_multires=4,
+            skips=[4]):
         super().__init__()
 
-        self.num_input_channels = num_input_channel
-        self.num_input_channels_views = num_input_channel_views
+        self.pts_embedder = Embedder(pts_embed_multires, num_input_channels)
+        self.view_embbedder = Embedder(view_embed_multires, num_input_view_channels)
+        
+        self.num_input_channels = num_input_channels
+        self.num_input_view_channels = num_input_view_channels
+        self.skips = skips
 
-        self.layers = nn.ModuleList(
-            [nn.Linear(num_input_channel, layer_width)] +
-            [nn.Linear(layer_width, layer_width) for _ in range(layer_depth - 1)]
-        )
+        self.pts_linears = nn.ModuleList(
+            [nn.Linear(self.pts_embedder.out_dim, layer_width)] + 
+            [nn.Linear(
+                layer_width if i not in skips else layer_width + self.pts_embedder.out_dim,
+                layer_width) for i in range(layer_depth -1)])
+    
+        self.views_linears = nn.ModuleList([nn.Linear(self.view_embbedder.out_dim + layer_width, layer_width // 2)])
 
-        self.view_layers = nn.ModuleList(
-            [nn.Linear(num_input_channel_views + layer_width, layer_width // 2)]
-        )
-
-        self.feature_layer = nn.Linear(layer_width, layer_width)
-        self.density_layer = nn.Linear(layer_width, 1)
-        self.rgb_layer = nn.Linear(layer_width // 2, 3)
-
+        self.feature_linear = nn.Linear(layer_width, layer_width)
+        self.alpha_linear = nn.Linear(layer_width, 1)
+        self.rgb_linear = nn.Linear(layer_width // 2, 3)
+    
     def forward(self, x):
-        input_pts, input_views = torch.split(
-            x,
-            [self.num_input_channels, self.num_input_channels_views],
-            dim=-1
-        )
+        input_pts, input_views = torch.split(x, [self.num_input_channels, self.num_input_view_channels], dim=-1)
+
+        input_pts = self.pts_embedder.embed(input_pts)
+        input_views = self.view_embbedder.embed(input_views)
 
         _x = input_pts
-        for layer in self.layers:
+        for i, layer in enumerate(self.pts_linears):
+            _x = F.relu(layer(_x))
+            if i in self.skips:
+                _x = torch.cat([input_pts, _x], dim=-1)
+        
+        alpha = self.alpha_linear(_x)
+        feature = self.feature_linear(_x)
+        _x = torch.cat([feature, input_views], dim=-1)
+
+        for layer in self.views_linears:
             _x = F.relu(layer(_x))
         
-        density = F.softplus(self.density_layer(_x))
-        features = self.feature_layer(_x)
-        _x = torch.cat([features, input_views], dim=-1)
-
-        for layer in self.view_layers:
-            _x = F.relu(layer(_x))
-
-        rgb = self.rgb_layer(_x)
-        outputs = torch.cat([rgb, density], dim=-1)
+        rgb = self.rgb_linear(_x)
+        outputs = torch.cat([rgb, alpha], dim=-1)
         return outputs
 
 
-def get_rays(K, c2w):
-    width = int(K[0, 2] * 2)
-    height = int(K[1, 2] * 2)
-    i, j = torch.meshgrid(
-        torch.linspace(0, height - 1, height),
-        torch.linspace(0, width -1, width),
-        indexing="ij"
-    )
-    
-    dirs = torch.stack([
-        (i - K[0][2]) / K[0][0],
-        -(j - K[1][2]) / K[1][1],
-        -torch.ones_like(i)], -1)
-    
-    ray_dirs = torch.sum(dirs[..., None, :] * c2w[:3, :3], -1)
-    ray_dirs = F.normalize(ray_dirs, dim=-1)
-    ray_origins = c2w[:3, 3].expand(ray_dirs.shape)
-    return ray_origins, ray_dirs
 
+def raw_to_outputs(raw, z_vals, ray_dirs, raw_noise_std):
+    distances = z_vals[..., 1:] - z_vals[..., :-1]
+    distances = torch.cat([distances, torch.Tensor([1e10]).expand(distances[..., :1].shape).to(distances.device)], dim=-1)
+    distances = (distances * torch.norm(ray_dirs[..., None, :], dim=-1)).to(raw.device)
 
-def sample_points(ray_origins, ray_dirs, near, far, num_samples):
-    z_uniform = torch.linspace(near, far, num_samples, device=ray_origins.device)
-    midpoints = 0.5 * (z_uniform[1:] + z_uniform[:-1])
-    upper_bounds = torch.cat([midpoints, z_uniform[-1:]], dim=-1)
-    lower_bounds = torch.cat([z_uniform[:1], midpoints], dim=-1)
-    z_rand = torch.rand(ray_origins.shape[:-1] + (num_samples,), device=ray_origins.device)
-    z_strata = lower_bounds + (upper_bounds - lower_bounds) * z_rand
-    pts = ray_origins[..., None, :] + ray_dirs[..., None, :] * z_strata[..., :, None]
-    return pts, z_strata
-
-
-def raw_to_outputs(raw, z_vals, ray_dirs, raw_noise_std=0):
-    N_rays = len(raw)
-    device = raw.device
-
-    rgb = torch.sigmoid(raw[..., :3])
-    sigma = F.softplus(raw[..., 3])
-
-    z_vals = z_vals.to(device)
-
+    rgb = torch.sigmoid(raw[..., :3]).reshape((*distances.shape, 3))
     if raw_noise_std > 0:
-        sigma += torch.randn(sigma.shape, device=device) * raw_noise_std
+        noise = torch.randn(raw[..., 3].shape, device=raw.device) * raw_noise_std
+    else:
+        noise = 0
+
+    alpha = 1 - torch.exp(-F.relu(raw[..., 3] + noise).reshape(distances.shape) * distances)
+    weights = (alpha * torch.cumprod(
+        torch.cat([
+            torch.ones((alpha.shape[0], 1), device=alpha.device),
+            1 - alpha + 1e-10], dim=-1), dim=-1)[:, :-1])
+
+    rgb_map = torch.sum(weights[..., None] * rgb, dim=-2)
+    return rgb_map, weights
+
+
+
+def render_ray_batch(models, model_device, ray_origins, ray_dirs, near, far, perturb, num_samples, raw_noise_std, N_importance):
+    near = near * torch.ones_like(ray_dirs[..., :1])
+    far = far * torch.ones_like(ray_dirs[..., :1])
+
+    t_vals = torch.linspace(0, 1, num_samples)
+    z_vals = 1 / ((1 / near) * (1 - t_vals) + (1 / far) * t_vals)
+
+    ray_origins = ray_origins.to(model_device)
+    ray_dirs = ray_dirs.to(model_device)
+
+    if perturb:
+        midpoints = 0.5 * (z_vals[..., 1:] + z_vals[..., :-1])
+        upper = torch.cat([midpoints, z_vals[..., -1:]], dim=-1)
+        lower = torch.cat([z_vals[..., :1], midpoints], dim=-1)
+        t_rand = torch.rand(z_vals.shape)
+        z_vals = (lower + (upper - lower) * t_rand)
     
-    distances = (z_vals[:, 1:] - z_vals[:, :-1])
-    distances = torch.cat([distances, torch.full((N_rays, 1), 1e10, device=device)], dim=-1)
-    distances = distances * torch.norm(ray_dirs[:, None, :], dim=-1).to(device)
+    z_vals = z_vals.to(model_device)
+    pts = ray_origins[..., None, :] + ray_dirs[..., None, :] * z_vals[..., :, None]
+    view_dirs1 = ray_dirs.unsqueeze(1).expand(-1, num_samples, -1)
 
-    alpha = 1 - torch.exp(-sigma * distances)
-    transmittance = torch.cat([
-        torch.ones(N_rays, 1, device=device),
-        1 - alpha[:, :-1] + 1e-10], dim=-1)
-    weights = alpha * torch.cumprod(transmittance, dim=-1)
+    inputs = torch.cat([pts, view_dirs1], dim=-1).reshape(-1, 6)
+    raw = models[0](inputs)
+    rgb0, weights0 = raw_to_outputs(raw, z_vals, ray_dirs, raw_noise_std)
+    if N_importance > 0:
+        z_vals_mid = (0.5 * (z_vals[..., 1:] + z_vals[..., :-1])).to(weights0.device)
+        z_samples = sample_pdf(z_vals_mid, weights0[..., 1:-1], N_importance, det=not perturb)
+        z_samples.detach()
 
-    rgb_map = torch.sum(weights[:, :, None] * rgb, dim=1)
-    depth_map = torch.sum(weights * z_vals, dim=-1)
-
-    return rgb_map, depth_map
-
-
-def render_ray_batch(model, ray_origins, ray_dirs, near, far, num_samples=64, raw_noise_std=0):
-    model_device = next(model.parameters()).device
-
-    pts, z_vals = sample_points(ray_origins, ray_dirs, near, far, num_samples)
-
-    flattened_pts = pts.reshape(-1, 3)
-    flattened_dirs = ray_dirs.reshape(-1, 3)
-    xy_norm = torch.norm(flattened_dirs[:, :2], dim=-1, keepdim=True)
-    theta = torch.atan2(flattened_dirs[:, 2], xy_norm.squeeze(-1))
-    phi = torch.atan2(flattened_dirs[:, 1], flattened_dirs[:, 0])
-    flattened_views = torch.stack([theta, phi], dim=-1)
-    flattened_views = flattened_views.unsqueeze(1).repeat(1, num_samples, 1).reshape(-1, 2)
-
-    rays = torch.cat([flattened_pts, flattened_views], dim=-1).to(model_device)
-    raw = model(rays).reshape(-1, num_samples, 4)
-    return raw_to_outputs(raw, z_vals, ray_dirs, raw_noise_std)
+        z_vals, _ = torch.sort(torch.cat([z_vals.to(z_samples.device), z_samples], dim=-1), dim=-1)
+        pts = ray_origins[..., None, :] + ray_dirs[..., None, :] * z_vals[..., :, None]
+        view_dirs2 = ray_dirs.unsqueeze(1).expand(-1, z_vals.shape[-1], -1).to(model_device)
+        inputs = torch.cat([pts, view_dirs2], dim=-1).reshape(-1, 6)
+        raw = models[1](inputs)
+        rgb1, _ = raw_to_outputs(raw, z_vals, ray_dirs, raw_noise_std)
+        return rgb0, rgb1
+    return rgb0
 
 
-def render(model, K, c2w, near=1.0, far=3.0, chunk_size=1024 * 32):
-    width = int(K[0, 2] * 2)
-    height = int(K[1, 2] * 2)
-    ray_origins, ray_dirs = get_rays(K, c2w)
+
+def render(models, model_device, dims, ray_origins, ray_dirs, near=1.0, far=6.0, chunk_size=1024 * 8, num_samples=32, raw_noise_std=0, perturb=False, N_importance=0):
+    B = ray_origins.shape[0]
     flat_ro = ray_origins.reshape(-1, 3)
     flat_rd = ray_dirs.reshape(-1, 3)
 
     N = len(flat_ro)
-    batches = int(np.ceil(N / chunk_size))
+    mini_batches = int(np.ceil(N / chunk_size))
 
-    rgb = []
-    depth = []
-    with torch.no_grad():
-        for i in range(batches):
-            rgb_map, depth_map = render_ray_batch(
-                model,
-                flat_ro[i * chunk_size:min((i + 1) * chunk_size, N)],
-                flat_rd[i * chunk_size:min((i + 1) * chunk_size, N)],
-                near,
-                far)
-            rgb_map = rgb_map.to("cpu")
-            depth_map = depth_map.to("cpu")
-            print(rgb_map.shape, depth_map.shape)
-            rgb.append(rgb_map)
-            depth.append(depth_map)
-    rgb = torch.cat(rgb, dim=0).reshape(height, width, 3)
-    depth = torch.cat(depth, dim=0).reshape(height, width)
-    return rgb, depth
+    rgb0 = []
+    rgb1 = []
+
+    for i in range(mini_batches):
+        ret = render_ray_batch(
+            models,
+            model_device,
+            flat_ro[i * chunk_size:min((i + 1) * chunk_size, N)],
+            flat_rd[i * chunk_size:min((i + 1) * chunk_size, N)],
+            near,
+            far,
+            perturb,
+            num_samples,
+            raw_noise_std,
+            N_importance)
+        
+        if N_importance > 0:
+            im0, im1 = ret
+            im0 = im0.to("cpu")
+            im1 = im1.to("cpu")
+            rgb0.append(im0)
+            rgb1.append(im1)
+        else:
+            im0 = ret
+            im0 = im0.to("cpu")
+            rgb0.append(im0)
+        
+    rgb0 = torch.cat(rgb0, dim=0).reshape(B, *dims, 3)
+    if N_importance > 0:
+        rgb1 = torch.cat(rgb1, dim=0).reshape(B, *dims, 3)
+        return rgb0, rgb1
+    return rgb0
+
+import cv2
+
+def train(models, dataloader: DataLoader):
+    model_device = next(models[0].parameters()).device
+    optimizer = torch.optim.AdamW(
+        list(models[0].parameters()) + list(models[1].parameters()),
+        betas=(0.9, 0.98),
+        lr=5e-4,
+        weight_decay=1e-5)
+    scheduler = torch.optim.lr_scheduler.ExponentialLR(optimizer, gamma=0.1**(1/100_000))
+    # scaler = torch.amp.GradScaler("cuda")
+
+    itr = 0
+    while True:
+        def train_step():
+            pixels, ray_origins, ray_dirs = dataloader.sample(2048)
+            # with torch.amp.autocast("cuda"):
+            rgb0, rgb1 = render_ray_batch(
+                models,
+                model_device,
+                ray_origins,
+                ray_dirs,
+                1.0,
+                6.0,
+                True,
+                64,
+                1,
+                128)
+            pixels = pixels.to(rgb0.device)
+            loss = F.mse_loss(rgb0, pixels) + F.mse_loss(rgb1, pixels)
+            
+            print(itr, loss.item())
+            
+            # scaler.scale(loss).backward()
+            # scaler.step(optimizer)
+            # scaler.update()
+            loss.backward()
+            optimizer.step()
+            scheduler.step()
+            optimizer.zero_grad()
+
+        train_step()
+
+        if itr % 2000 == 0:
+            torch.save(models[0].state_dict(), f"./models/lego_0_{itr}.pth")
+            torch.save(models[1].state_dict(), f"./models/lego_1_{itr}.pth")
+
+        if itr % 1000 == 0:
+            path = os.path.join("./outputs")
+
+            with torch.no_grad():
+                for i in np.random.randint(0, len(dataloader), 3):
+                    K, c2w, ray_origins, ray_dirs, img = dataloader.load_image(i, 0.3)
+                    ray_origins = ray_origins[None, ...]
+                    ray_dirs = ray_dirs[None, ...]
+                    rgb0, rgb1 = render(models, model_device, img.shape[:2], ray_origins, ray_dirs, 1.0, 6.0, num_samples=64, N_importance=128)
+
+                    y_true = img.detach().cpu().numpy()
+                    y_pred0 = rgb0[0].detach().cpu().numpy()
+                    y_pred1 = rgb1[0].detach().cpu().numpy()
+
+                    img = np.concat([y_true, y_pred0, y_pred1], axis=1)
+                    img = (cv2.cvtColor(img, cv2.COLOR_RGB2BGR) * 255).astype(np.uint8)
+                    cv2.imwrite(os.path.join(path, f"{itr}_{i}.png"), img)    
+
+        itr += 1
 
 
-# def train():
+        # for K, c2w, ray_origins, ray_dirs, img in dataloader:
+        #     print(itr)
+        #     dims = img.shape[1:3]
 
+        #     with torch.amp.autocast("cuda"):
+        #         step = 1
+        #         for i in range(0, dataloader.batch_size, step):
+        #             rgb0, rgb1 = render(models, model_device, dims, ray_origins[i:i+step], ray_dirs[i:i+step], train=True, perturb=True, raw_noise_std=1, N_importance=16)
+        #             imgd = img[i:i+step].to(model_device)
+        #             loss = F.mse_loss(rgb0, imgd) + F.mse_loss(rgb1, imgd)
+        #             scaler.scale(loss).backward()
+
+        #         scaler.step(optimizer)
+        #         scaler.update()
+        #         optimizer.zero_grad()
+
+        #     y_true = img[0].detach().cpu().numpy()
+        #     y_pred0 = rgb0[0].detach().cpu().numpy()
+        #     y_pred1 = rgb1[0].detach().cpu().numpy()
+
+        #     cv2.imshow("img", np.concat([y_true, y_pred0, y_pred1], axis=0))
+        #     cv2.waitKey(1)
+
+            # if itr % 2000 == 0:
+            #     torch.save(models[0].state_dict(), f"./drums{itr}.pth")
+
+            # itr += 1
+
+            
 
 
 if __name__ == "__main__":
     device = torch.device("cuda")
 
-    model = NeRF_Model().to(device)
+    model_coarse = NeRF_Model().to(device)
+    model_fine = NeRF_Model().to(device)
 
-    width = 300
-    height = 300
-    focal_length = 100
+    # width = 500
+    # height = 500
+    # focal_length = 100
 
-    K = torch.tensor([[focal_length, 0, width / 2], [0, focal_length, height / 2], [0, 0, 1]])
-    c2w = torch.eye(4)
-    c2w[2, 3] = -3.0
+    # K = torch.tensor([[focal_length, 0, width / 2], [0, focal_length, height / 2], [0, 0, 1]])
+    # c2w = torch.eye(4)
+    # c2w[2, 3] = -3.0
 
-    rgb, depth = render(model, K, c2w)
+    # rgb, depth = render(model, K, c2w)
 
-    rgb = rgb.numpy()
+    # rgb = rgb.numpy()
     
-    import cv2
-    bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
-    cv2.imshow("img", bgr)
-    cv2.waitKey(0)
+    # import cv2
+    # bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
+    # cv2.imshow("img", bgr)
+    # cv2.waitKey(0)
+
+    dataloader = NeRFRayDataLoader(
+        NeRFDataset(os.path.join("./dataset", "nerf_synthetic", "lego")),
+        "train"
+    )
+
+    # model_coarse.load_state_dict(torch.load(f"./models/lego_0_254000.pth"))
+    # model_coarse = model_coarse.to(device)
+    # model_fine.load_state_dict(torch.load(f"./models/lego_1_254000.pth"))
+    # model_fine = model_fine.to(device)
+
+    train((model_coarse, model_fine), dataloader)
+
+    # summary(model_fine, (6,), batch_size=4096)
+    # exit()
+
+
+    for i in range(100):
+        K, c2w, ray_origins, ray_dirs, img = dataloader.load_image(i, 0.4)
+
+        ray_origins = ray_origins[None, ...]
+        ray_dirs = ray_dirs[None, ...]
+
+        with torch.no_grad():
+            rgb0, rgb1 = render((model_coarse, model_fine), device, img.shape[:2], ray_origins, ray_dirs, num_samples=64, N_importance=256, perturb=False)
+
+        y_true = img.detach().cpu().numpy()
+        y_pred0 = rgb0[0].detach().cpu().numpy()
+        y_pred1 = rgb1[0].detach().cpu().numpy()
+        
+        cv2.imshow("img", np.concat([y_true, y_pred0, y_pred1], axis=1))
+        cv2.waitKey(1)
+        
