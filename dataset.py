@@ -189,14 +189,13 @@ class NeRFDataLoaderDataset(Dataset):
         return K, c2w, ray_origins, ray_dirs, img
 
 
-import time
 class FastWeightedSampler:
     def __init__(self, probs):
         probs = np.asarray(probs, dtype=np.float64)
         if probs.sum() == 0:
             raise ValueError("Probabilities sum to zero")
-        self.cdf = np.cumsum(probs)  # Precompute CDF once
-        self.cdf /= self.cdf[-1]     # Normalize to [0, 1]
+        self.cdf = np.cumsum(probs)
+        self.cdf /= self.cdf[-1]
 
     def sample(self, size):
         r = np.random.random(size)
@@ -236,9 +235,10 @@ class NeRFRayDataLoader:
         self.cached_pixels = np.concat(self.cached_pixels, axis=0)
         self.cached_ray_origins = np.concat(self.cached_ray_origins, axis=0)
         self.cached_ray_dirs = np.concat(self.cached_ray_dirs, axis=0)
-        mask = (self.cached_pixels > 0.05).any(axis=1)
-        self.prob = (0.75 * mask) + 0.25 * (1 - mask)
-        self.prob = self.prob / self.prob.sum()
+        # mask = (self.cached_pixels > 0.025).any(axis=1)
+        # self.prob = (0.9 * mask) + 0.1 * (1 - mask)
+        # self.prob = self.prob / self.prob.sum()
+        self.prob = np.ones((len(self.cached_pixels,)))
         self.sampler = FastWeightedSampler(self.prob)
         
     def __len__(self):
