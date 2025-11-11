@@ -2,6 +2,10 @@ import numpy as np
 import torch
 
 
+def chunkify(x, chunk_size):
+    return [x[i:i + chunk_size] for i in range(0, len(x), chunk_size)]
+
+
 def get_rays(height, width, K, c2w):
     i, j = np.meshgrid(np.arange(width, dtype=np.float32), np.arange(height, dtype=np.float32), indexing="xy")
     dirs = np.stack([

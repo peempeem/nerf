@@ -11,6 +11,36 @@ from torch.utils.data import Dataset
 from helpers import *
 
 
+trans_t = lambda t : np.array([
+    [1,0,0,0],
+    [0,1,0,0],
+    [0,0,1,t],
+    [0,0,0,1],
+], dtype=np.float32)
+
+rot_phi = lambda phi : np.array([
+    [1,0,0,0],
+    [0,np.cos(phi),-np.sin(phi),0],
+    [0,np.sin(phi), np.cos(phi),0],
+    [0,0,0,1],
+], dtype=np.float32)
+
+rot_theta = lambda th : np.array([
+    [np.cos(th),0,-np.sin(th),0],
+    [0,1,0,0],
+    [np.sin(th),0, np.cos(th),0],
+    [0,0,0,1],
+], dtype=np.float32)
+
+
+def pose_spherical(theta, phi, radius):
+    c2w = trans_t(radius)
+    c2w = rot_phi(phi/180.*np.pi) @ c2w
+    c2w = rot_theta(theta/180.*np.pi) @ c2w
+    c2w = np.array([[-1,0,0,0],[0,0,1,0],[0,1,0,0],[0,0,0,1]]) @ c2w
+    return c2w
+
+
 class NeRFDataset:
     def __init__(self, dataset_path: str):
         if "nerf_synthetic" in dataset_path:
@@ -31,7 +61,15 @@ class NeRFDataset:
             with open(os.path.join(dataset_path, f"transforms_{split}.json")) as f:
                 tf_data = json.load(f)
 
-            self.data["camera_angle_x"] = float(tf_data["camera_angle_x"])
+
+            w, h = 800, 800
+            focal = 0.5 * w / np.tan(0.5 * tf_data["camera_angle_x"])
+
+            self.data["K"] = np.array([
+                [focal, 0, w / 2],
+                [0, focal, h / 2],
+                [0, 0, 1]
+            ], np.float32)
             
             paths = []
             rotations = []
@@ -45,79 +83,84 @@ class NeRFDataset:
                 paths.append(os.path.join(dataset_path, split, file_endings[frame["file_path"].split("/")[-1]]))
                 rotations.append(float(frame["rotation"]))
                 transforms.append(np.array(frame["transform_matrix"], np.float32))
+
+            transforms = np.asarray(transforms)
             
             self.data[split] = {
                 "path": paths,
                 "rotation": rotations,
                 "transform": transforms,
-                "len": len(tf_data["frames"])
+                "len": len(tf_data["frames"]),
+                "bound_norm_scale": np.abs(transforms[:, :3, 3]).max()
             }
+            
+
         
-        colmap_path = os.path.join(dataset_path, "colmap")
-        if not os.path.exists(colmap_path):
-            os.mkdir(colmap_path)
+        # colmap_path = os.path.join(dataset_path, "colmap")
+        # if not os.path.exists(colmap_path):
+        #     os.mkdir(colmap_path)
         
-        valid_reconstruction = True
+        # valid_reconstruction = True
 
-        try:
-            sparse_path = os.path.join(colmap_path, "sparse")
-            sparse0_path = os.path.join(sparse_path, "0")
-            reconstruction = pycolmap.Reconstruction(sparse0_path)
-        except:
-            valid_reconstruction = False
+        # try:
+        #     sparse_path = os.path.join(colmap_path, "sparse")
+        #     sparse0_path = os.path.join(sparse_path, "0")
+        #     reconstruction = pycolmap.Reconstruction(sparse0_path)
+        # except:
+        #     valid_reconstruction = False
         
-        if not valid_reconstruction:
-            shutil.rmtree(colmap_path)
-            os.mkdir(colmap_path)
+        # if not valid_reconstruction:
+        #     shutil.rmtree(colmap_path)
+        #     os.mkdir(colmap_path)
 
-            database_path = os.path.join(colmap_path, "database.db")
+        #     database_path = os.path.join(colmap_path, "database.db")
 
-            sift_options = pycolmap.SiftExtractionOptions()
-            sift_options.use_gpu = True
+        #     sift_options = pycolmap.SiftExtractionOptions()
+        #     sift_options.use_gpu = True
 
-            image_path = os.path.dirname(self.data["train"]["path"][0])
+        #     image_path = os.path.dirname(self.data["train"]["path"][0])
 
-            pycolmap.extract_features(
-                database_path,
-                image_path,
-                camera_mode=pycolmap.CameraMode.SINGLE,
-                camera_model="SIMPLE_PINHOLE",
-                sift_options=sift_options
-            )
+        #     pycolmap.extract_features(
+        #         database_path,
+        #         image_path,
+        #         camera_mode=pycolmap.CameraMode.SINGLE,
+        #         camera_model="SIMPLE_PINHOLE",
+        #         sift_options=sift_options
+        #     )
 
-            sift_options = pycolmap.SiftMatchingOptions()
-            sift_options.use_gpu = True
+        #     sift_options = pycolmap.SiftMatchingOptions()
+        #     sift_options.use_gpu = True
 
-            pycolmap.match_exhaustive(database_path, sift_options)
+        #     pycolmap.match_exhaustive(database_path, sift_options)
 
-            mapper_options = pycolmap.IncrementalPipelineOptions()
-            mapper_options.ba_refine_focal_length = True
-            mapper_options.ba_refine_principal_point = True
-            mapper_options.ba_refine_extra_params = False
+        #     mapper_options = pycolmap.IncrementalPipelineOptions()
+        #     mapper_options.ba_refine_focal_length = True
+        #     mapper_options.ba_refine_principal_point = True
+        #     mapper_options.ba_refine_extra_params = False
 
-            pycolmap.incremental_mapping(
-                database_path,
-                image_path,
-                sparse_path,
-                mapper_options
-            )
+        #     pycolmap.incremental_mapping(
+        #         database_path,
+        #         image_path,
+        #         sparse_path,
+        #         mapper_options
+        #     )
         
-            reconstruction = pycolmap.Reconstruction(sparse0_path)
+        #     reconstruction = pycolmap.Reconstruction(sparse0_path)
 
-        rich.print(f"Loaded reconstruction from {sparse0_path}")
+        # rich.print(f"Loaded reconstruction from {sparse0_path}")
 
-        cam = reconstruction.cameras[1]
-        rich.print(f"Found Camera Intrinsics:")
-        rich.print(f"  fx", cam.focal_length_x)
-        rich.print(f"  fy", cam.focal_length_y)
-        rich.print(f"  px", cam.principal_point_x)
-        rich.print(f"  py", cam.principal_point_y)
+        # cam = reconstruction.cameras[1]
+        # rich.print(f"Found Camera Intrinsics:")
+        # rich.print(f"  fx", cam.focal_length_x)
+        # rich.print(f"  fy", cam.focal_length_y)
+        # rich.print(f"  px", cam.principal_point_x)
+        # rich.print(f"  py", cam.principal_point_y)
         
-        self.data["K"] = np.array([
-            [cam.focal_length_x, 0, cam.principal_point_x],
-            [0, cam.focal_length_y, cam.principal_point_y],
-            [0, 0, 1]
-        ], np.float32)
+        # self.data["K"] = np.array([
+        #     [cam.focal_length_x, 0, cam.principal_point_x],
+        #     [0, cam.focal_length_y, cam.principal_point_y],
+        #     [0, 0, 1]
+        # ], np.float32)
         
 
     def _load_llff(self, dataset_path: str):
@@ -127,10 +170,22 @@ class NeRFDataset:
         raise NotImplementedError("TODO")
     
     def load_image(self, image_path: str, scale: float=None):
-        img = cv2.imread(image_path)
-        if len(img.shape) != 3:
+        img = cv2.imread(image_path, cv2.IMREAD_UNCHANGED)
+        if len(img.shape) == 2:
+            img = img.reshape((*img.shape, 1))
+        elif len(img.shape) != 3:
             raise ValueError(f"unknown image shape {img.shape} -- should be a tuple of length 3")
-        img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+        else:
+            match img.shape[-1]:
+                case 1:
+                    img = cv2.cvtColor(img, cv2.COLOR_GRAY2RGBA)
+                case 3:
+                    img = cv2.cvtColor(img, cv2.COLOR_BGR2RGBA)
+                case 4:
+                    img = cv2.cvtColor(img, cv2.COLOR_BGRA2RGBA)
+                case _:
+                    raise ValueError(f"unknown # of image channels: {img.shape[-1]} -- should be 1, 3, or 4")
+
         match img.dtype:
             case np.uint8:
                 img = img.astype(np.float32) / np.iinfo(np.uint8).max
@@ -140,6 +195,13 @@ class NeRFDataset:
                 pass
             case _:
                 raise ValueError("unknown image data type")
+        
+        rgb = img[..., :3]
+        alpha = img[..., 3:4]
+        white = np.full_like(rgb, 1)
+
+        img = (alpha * rgb + (1 - alpha) * white)
+        
         if scale is not None:
             w = int(img.shape[1] * scale)
             h = int(img.shape[0] * scale)
@@ -147,46 +209,46 @@ class NeRFDataset:
         return img
     
 
-class NeRFDataLoaderDataset(Dataset):
-    def __init__(self, dataset: NeRFDataset, split: str, scale: float=None):
-        super().__init__()
-        self.dataset = dataset
-        self.split = split
-        self.scale = scale
+# class NeRFDataLoaderDataset(Dataset):
+#     def __init__(self, dataset: NeRFDataset, split: str, scale: float=None):
+#         super().__init__()
+#         self.dataset = dataset
+#         self.split = split
+#         self.scale = scale
 
-        self.cached_K = []
-        self.cached_ray_origins = []
-        self.cached_ray_dirs = []
-        self.cached_images = []
+#         self.cached_K = []
+#         self.cached_ray_origins = []
+#         self.cached_ray_dirs = []
+#         self.cached_images = []
 
-        with Progress() as p:
-            task = p.add_task("Caching dataset rays + images ...", total=len(self))
-            for i in range(len(self)):
-                scale_matrix = np.array([
-                    [scale, 0, 0],
-                    [0, scale, 0],
-                    [0, 0, 1]
-                ], np.float32)
-                self.cached_K.append(scale_matrix.dot(self.dataset.data["K"]))
-                c2w = self.dataset.data[self.split]["transform"][i]
-                img = self.dataset.load_image(self.dataset.data[self.split]["path"][i], self.scale)
-                height, width = img.shape[:2]
-                ray_origins, ray_dirs = get_rays(height, width, self.cached_K[-1], c2w)
-                self.cached_ray_origins.append(ray_origins)
-                self.cached_ray_dirs.append(ray_dirs)
-                self.cached_images.append(img)
-                p.update(task, advance=1)
+#         with Progress() as p:
+#             task = p.add_task("Caching dataset rays + images ...", total=len(self))
+#             for i in range(len(self)):
+#                 scale_matrix = np.array([
+#                     [scale, 0, 0],
+#                     [0, scale, 0],
+#                     [0, 0, 1]
+#                 ], np.float32)
+#                 self.cached_K.append(scale_matrix.dot(self.dataset.data["K"]))
+#                 c2w = self.dataset.data[self.split]["transform"][i]
+#                 img = self.dataset.load_image(self.dataset.data[self.split]["path"][i], self.scale)
+#                 height, width = img.shape[:2]
+#                 ray_origins, ray_dirs = get_rays(height, width, self.cached_K[-1], c2w)
+#                 self.cached_ray_origins.append(ray_origins)
+#                 self.cached_ray_dirs.append(ray_dirs)
+#                 self.cached_images.append(img)
+#                 p.update(task, advance=1)
 
-    def __len__(self):
-        return self.dataset.data[self.split]["len"]
+#     def __len__(self):
+#         return self.dataset.data[self.split]["len"]
 
-    def __getitem__(self, idx):
-        K = torch.from_numpy(self.cached_K[idx])
-        c2w = torch.from_numpy(self.dataset.data[self.split]["transform"][idx])
-        ray_origins = torch.from_numpy(self.cached_ray_origins[idx].copy())
-        ray_dirs = torch.from_numpy(self.cached_ray_dirs[idx])
-        img = torch.from_numpy(self.cached_images[idx])
-        return K, c2w, ray_origins, ray_dirs, img
+#     def __getitem__(self, idx):
+#         K = torch.from_numpy(self.cached_K[idx])
+#         c2w = torch.from_numpy(self.dataset.data[self.split]["transform"][idx])
+#         ray_origins = torch.from_numpy(self.cached_ray_origins[idx].copy())
+#         ray_dirs = torch.from_numpy(self.cached_ray_dirs[idx])
+#         img = torch.from_numpy(self.cached_images[idx])
+#         return K, c2w, ray_origins, ray_dirs, img
 
 
 class FastWeightedSampler:
@@ -206,8 +268,7 @@ class NeRFRayDataLoader:
         self.dataset = dataset
         self.split = split
 
-        self.cached_dims = []
-        self.cached_pixels = []
+        self.cached_rgb = []
         self.cached_ray_origins = []
         self.cached_ray_dirs = []
         
@@ -215,43 +276,34 @@ class NeRFRayDataLoader:
             task = p.add_task("Loading rays + images ...", total=len(self))
 
             for i in range(len(self)):
-                K = self.dataset.data["K"]
-                c2w = self.dataset.data[self.split]["transform"][i]
-                img = self.dataset.load_image(self.dataset.data[self.split]["path"][i])
-                height, width = img.shape[:2]
-                ray_origins, ray_dirs = get_rays(height, width, K, c2w)
+                K, c2w, ray_origins, ray_dirs, img = self.load_image(i)
+                img = img.numpy()
 
-                pixels = img.reshape(-1, img.shape[-1])
-                ray_origins = ray_origins.reshape(-1, ray_origins.shape[-1])
-                ray_dirs = ray_dirs.reshape(-1, ray_origins.shape[-1])
-
-                self.cached_dims.append((height, width))
-                self.cached_pixels.append(pixels)
-                self.cached_ray_origins.append(ray_origins)
-                self.cached_ray_dirs.append(ray_dirs)
+                self.cached_rgb.append(img.reshape(-1, 3))
+                self.cached_ray_origins.append(ray_origins.numpy().reshape(-1, ray_origins.shape[-1]))
+                self.cached_ray_dirs.append(ray_dirs.numpy().reshape(-1, ray_dirs.shape[-1]))
                 p.update(task, advance=1)
         
-        self.cached_dims = np.concat(self.cached_dims, axis=0)
-        self.cached_pixels = np.concat(self.cached_pixels, axis=0)
+        self.cached_rgb = np.concat(self.cached_rgb, axis=0)
         self.cached_ray_origins = np.concat(self.cached_ray_origins, axis=0)
         self.cached_ray_dirs = np.concat(self.cached_ray_dirs, axis=0)
-        # mask = (self.cached_pixels > 0.025).any(axis=1)
-        # self.prob = (0.9 * mask) + 0.1 * (1 - mask)
-        # self.prob = self.prob / self.prob.sum()
-        self.prob = np.ones((len(self.cached_pixels,)))
-        self.sampler = FastWeightedSampler(self.prob)
+        #mask = (self.cached_pixels > 0.01).any(axis=1)
+        #self.prob = (0.9 * mask) + 0.1 * (1 - mask)
+        #self.prob = self.prob / self.prob.sum()
+        # self.prob = np.ones((len(self.cached_pixels,)))
+        # self.sampler = FastWeightedSampler(self.prob)
         
     def __len__(self):
         return self.dataset.data[self.split]["len"]
     
     def sample(self, batch_size):
-        indicies = self.sampler.sample(batch_size)
-        pixels = torch.from_numpy(self.cached_pixels[indicies])
-        ray_origins = torch.from_numpy(self.cached_ray_origins[indicies])
-        ray_dirs = torch.from_numpy(self.cached_ray_dirs[indicies])
-        return pixels, ray_origins, ray_dirs
+        indices = np.random.choice(len(self.cached_rgb), batch_size, replace=True)
+        rgbs = torch.from_numpy(self.cached_rgb[indices])
+        ray_origins = torch.from_numpy(self.cached_ray_origins[indices])
+        ray_dirs = torch.from_numpy(self.cached_ray_dirs[indices])
+        return rgbs, ray_origins, ray_dirs
     
-    def load_image(self, index, scale=None):
+    def load_image(self, index, scale=None, bound_norm_scale=None):
         K = self.dataset.data["K"]
         if scale is not None:
             scale_matrix = np.array([
@@ -261,8 +313,9 @@ class NeRFRayDataLoader:
                 ], np.float32)
             K = scale_matrix.dot(K)
         
-        c2w = self.dataset.data[self.split]["transform"][index]
+        c2w = self.dataset.data[self.split]["transform"][index].copy()
         img = torch.from_numpy(self.dataset.load_image(self.dataset.data[self.split]["path"][index], scale))
+        c2w[:3, 3] /= self.dataset.data[self.split]["bound_norm_scale"] if bound_norm_scale is None else bound_norm_scale
         ray_origins, ray_dirs = get_rays(*img.shape[:2], K, c2w)
         ray_origins = torch.from_numpy(ray_origins.copy())
         ray_dirs = torch.from_numpy(ray_dirs.copy())
@@ -279,5 +332,5 @@ if __name__ == "__main__":
     )
 
     while True:
-        pixels, ray_origins, ray_dirs = ds.sample(4096)
-        print(pixels.shape, ray_origins.shape, ray_dirs.shape)
+        K, c2w, ray_origins, ray_dirs, img = ds.load_image(0)
+        print(c2w)
