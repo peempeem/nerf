@@ -93,78 +93,98 @@ class NeRFDataset:
                 "len": len(tf_data["frames"]),
                 "bound_norm_scale": np.abs(transforms[:, :3, 3]).max()
             }
-            
-
-        
-        # colmap_path = os.path.join(dataset_path, "colmap")
-        # if not os.path.exists(colmap_path):
-        #     os.mkdir(colmap_path)
-        
-        # valid_reconstruction = True
-
-        # try:
-        #     sparse_path = os.path.join(colmap_path, "sparse")
-        #     sparse0_path = os.path.join(sparse_path, "0")
-        #     reconstruction = pycolmap.Reconstruction(sparse0_path)
-        # except:
-        #     valid_reconstruction = False
-        
-        # if not valid_reconstruction:
-        #     shutil.rmtree(colmap_path)
-        #     os.mkdir(colmap_path)
-
-        #     database_path = os.path.join(colmap_path, "database.db")
-
-        #     sift_options = pycolmap.SiftExtractionOptions()
-        #     sift_options.use_gpu = True
-
-        #     image_path = os.path.dirname(self.data["train"]["path"][0])
-
-        #     pycolmap.extract_features(
-        #         database_path,
-        #         image_path,
-        #         camera_mode=pycolmap.CameraMode.SINGLE,
-        #         camera_model="SIMPLE_PINHOLE",
-        #         sift_options=sift_options
-        #     )
-
-        #     sift_options = pycolmap.SiftMatchingOptions()
-        #     sift_options.use_gpu = True
-
-        #     pycolmap.match_exhaustive(database_path, sift_options)
-
-        #     mapper_options = pycolmap.IncrementalPipelineOptions()
-        #     mapper_options.ba_refine_focal_length = True
-        #     mapper_options.ba_refine_principal_point = True
-        #     mapper_options.ba_refine_extra_params = False
-
-        #     pycolmap.incremental_mapping(
-        #         database_path,
-        #         image_path,
-        #         sparse_path,
-        #         mapper_options
-        #     )
-        
-        #     reconstruction = pycolmap.Reconstruction(sparse0_path)
-
-        # rich.print(f"Loaded reconstruction from {sparse0_path}")
-
-        # cam = reconstruction.cameras[1]
-        # rich.print(f"Found Camera Intrinsics:")
-        # rich.print(f"  fx", cam.focal_length_x)
-        # rich.print(f"  fy", cam.focal_length_y)
-        # rich.print(f"  px", cam.principal_point_x)
-        # rich.print(f"  py", cam.principal_point_y)
-        
-        # self.data["K"] = np.array([
-        #     [cam.focal_length_x, 0, cam.principal_point_x],
-        #     [0, cam.focal_length_y, cam.principal_point_y],
-        #     [0, 0, 1]
-        # ], np.float32)
         
 
-    def _load_llff(self, dataset_path: str):
-        raise NotImplementedError("TODO")
+    def _load_llff(self, dataset_path: str, image_dir="images_8"):
+        rich.print(f"Loading llff dataset from {dataset_path}")
+
+        self.data = {"type": "llff"}
+
+        colmap_path = os.path.join(dataset_path, "colmap")
+        if not os.path.exists(colmap_path):
+            os.mkdir(colmap_path)
+        
+        valid_reconstruction = True
+
+        try:
+            sparse_path = os.path.join(colmap_path, "sparse")
+            sparse0_path = os.path.join(sparse_path, "0")
+            reconstruction = pycolmap.Reconstruction(sparse0_path)
+        except:
+            valid_reconstruction = False
+
+        image_path = os.path.join(dataset_path, image_dir)
+        
+        if not valid_reconstruction:
+            shutil.rmtree(colmap_path)
+            os.mkdir(colmap_path)
+
+            database_path = os.path.join(colmap_path, "database.db")
+
+            sift_options = pycolmap.SiftExtractionOptions()
+            sift_options.max_image_size = 1600
+            sift_options.max_num_features = 4096
+            sift_options.use_gpu = True
+
+            pycolmap.extract_features(
+                database_path,
+                image_path,
+                camera_mode=pycolmap.CameraMode.SINGLE,
+                camera_model="SIMPLE_RADIAL",
+                sift_options=sift_options,
+                device=pycolmap.Device.auto
+            )
+
+            sift_options = pycolmap.SiftMatchingOptions()
+            sift_options.use_gpu = True
+
+            pycolmap.match_exhaustive(database_path, sift_options)
+
+            mapper_options = pycolmap.IncrementalPipelineOptions()
+            mapper_options.ba_refine_focal_length = True
+            mapper_options.ba_refine_principal_point = True
+            mapper_options.ba_refine_extra_params = False
+
+            pycolmap.incremental_mapping(
+                database_path,
+                image_path,
+                sparse_path,
+                mapper_options
+            )
+        
+            reconstruction = pycolmap.Reconstruction(sparse0_path)
+
+        rich.print(f"Loaded reconstruction from {sparse0_path}")
+
+        cam = reconstruction.cameras[1]
+        rich.print(f"Found Camera Intrinsics:")
+        rich.print(f"  fx", cam.focal_length_x)
+        rich.print(f"  fy", cam.focal_length_y)
+        rich.print(f"  px", cam.principal_point_x)
+        rich.print(f"  py", cam.principal_point_y)
+        
+        self.data["focal"] = cam.focal_length_x
+        self.data["K"] = np.array([
+            [cam.focal_length_x, 0, cam.principal_point_x],
+            [0, cam.focal_length_y, cam.principal_point_y],
+            [0, 0, 1]
+        ], np.float32)
+
+        paths = []
+        transforms = []
+        for image in reconstruction.images.values():
+            paths.append(os.path.join(image_path, image.name))
+            c2w = image.cam_from_world().inverse().matrix()
+            c2w = np.concat([c2w, np.array([[0, 0, 0, 1]])], axis=0)
+            transforms.append(c2w)
+
+        self.data["train"] = {
+            "path": paths,
+            "transform": np.asarray(transforms, np.float32),
+            "len": len(transforms),
+            "bound_norm_scale": 1
+        }   
+
 
     def _load_real_360(self, dataset_path: str):
         raise NotImplementedError("TODO")
@@ -207,61 +227,7 @@ class NeRFDataset:
             h = int(img.shape[0] * scale)
             img = cv2.resize(img, (w, h))
         return img
-    
 
-# class NeRFDataLoaderDataset(Dataset):
-#     def __init__(self, dataset: NeRFDataset, split: str, scale: float=None):
-#         super().__init__()
-#         self.dataset = dataset
-#         self.split = split
-#         self.scale = scale
-
-#         self.cached_K = []
-#         self.cached_ray_origins = []
-#         self.cached_ray_dirs = []
-#         self.cached_images = []
-
-#         with Progress() as p:
-#             task = p.add_task("Caching dataset rays + images ...", total=len(self))
-#             for i in range(len(self)):
-#                 scale_matrix = np.array([
-#                     [scale, 0, 0],
-#                     [0, scale, 0],
-#                     [0, 0, 1]
-#                 ], np.float32)
-#                 self.cached_K.append(scale_matrix.dot(self.dataset.data["K"]))
-#                 c2w = self.dataset.data[self.split]["transform"][i]
-#                 img = self.dataset.load_image(self.dataset.data[self.split]["path"][i], self.scale)
-#                 height, width = img.shape[:2]
-#                 ray_origins, ray_dirs = get_rays(height, width, self.cached_K[-1], c2w)
-#                 self.cached_ray_origins.append(ray_origins)
-#                 self.cached_ray_dirs.append(ray_dirs)
-#                 self.cached_images.append(img)
-#                 p.update(task, advance=1)
-
-#     def __len__(self):
-#         return self.dataset.data[self.split]["len"]
-
-#     def __getitem__(self, idx):
-#         K = torch.from_numpy(self.cached_K[idx])
-#         c2w = torch.from_numpy(self.dataset.data[self.split]["transform"][idx])
-#         ray_origins = torch.from_numpy(self.cached_ray_origins[idx].copy())
-#         ray_dirs = torch.from_numpy(self.cached_ray_dirs[idx])
-#         img = torch.from_numpy(self.cached_images[idx])
-#         return K, c2w, ray_origins, ray_dirs, img
-
-
-class FastWeightedSampler:
-    def __init__(self, probs):
-        probs = np.asarray(probs, dtype=np.float64)
-        if probs.sum() == 0:
-            raise ValueError("Probabilities sum to zero")
-        self.cdf = np.cumsum(probs)
-        self.cdf /= self.cdf[-1]
-
-    def sample(self, size):
-        r = np.random.random(size)
-        return np.searchsorted(self.cdf, r)
 
 class NeRFRayDataLoader:
     def __init__(self, dataset: NeRFDataset, split: str):
@@ -287,11 +253,6 @@ class NeRFRayDataLoader:
         self.cached_rgb = np.concat(self.cached_rgb, axis=0)
         self.cached_ray_origins = np.concat(self.cached_ray_origins, axis=0)
         self.cached_ray_dirs = np.concat(self.cached_ray_dirs, axis=0)
-        #mask = (self.cached_pixels > 0.01).any(axis=1)
-        #self.prob = (0.9 * mask) + 0.1 * (1 - mask)
-        #self.prob = self.prob / self.prob.sum()
-        # self.prob = np.ones((len(self.cached_pixels,)))
-        # self.sampler = FastWeightedSampler(self.prob)
         
     def __len__(self):
         return self.dataset.data[self.split]["len"]
@@ -303,7 +264,7 @@ class NeRFRayDataLoader:
         ray_dirs = torch.from_numpy(self.cached_ray_dirs[indices])
         return rgbs, ray_origins, ray_dirs
     
-    def load_image(self, index, scale=None, bound_norm_scale=None):
+    def load_image(self, index, scale=None, bound_norm_scale=None, near=1):
         K = self.dataset.data["K"]
         if scale is not None:
             scale_matrix = np.array([
@@ -317,6 +278,8 @@ class NeRFRayDataLoader:
         img = torch.from_numpy(self.dataset.load_image(self.dataset.data[self.split]["path"][index], scale))
         c2w[:3, 3] /= self.dataset.data[self.split]["bound_norm_scale"] if bound_norm_scale is None else bound_norm_scale
         ray_origins, ray_dirs = get_rays(*img.shape[:2], K, c2w)
+        if self.dataset.data["type"] != "synthetic":
+            ray_origins, ray_dirs = ndc_rays(*img.shape[:2], self.dataset.data["focal"], near, ray_origins, ray_dirs)
         ray_origins = torch.from_numpy(ray_origins.copy())
         ray_dirs = torch.from_numpy(ray_dirs.copy())
         K = torch.from_numpy(K)
@@ -327,7 +290,7 @@ class NeRFRayDataLoader:
 
 if __name__ == "__main__":
     ds = NeRFRayDataLoader(
-        NeRFDataset(os.path.join("./dataset", "nerf_synthetic", "drums")),
+        NeRFDataset(os.path.join("./dataset", "nerf_llff_data", "fern")),
         "train",
     )
 

@@ -18,9 +18,12 @@ def get_rays(height, width, K, c2w):
     return ray_origins, ray_dirs
 
 
-def sample_stratified(ray_origins, ray_dirs, near, far, n_samples, perturb):
+def sample_stratified(ray_origins, ray_dirs, near, far, n_samples, perturb, lindisp):
     t_vals = torch.linspace(0, 1, n_samples, device=ray_origins.device)
-    z_vals = 1 / ((1 / near) * (1 - t_vals) + (1 / far) * t_vals)
+    if lindisp:
+        z_vals = 1 / ((1 / near) * (1 - t_vals) + (1 / far) * t_vals)
+    else:
+        z_vals = near * (1 - t_vals) + far * t_vals
 
     if perturb:
         midpoints = 0.5 * (z_vals[1:] + z_vals[:-1])
@@ -81,31 +84,25 @@ def cumprod_exclusive(x):
     return cumprod
 
 
-# def sample_pdf(bins, weights, N_samples, det=False):
-#     weights = weights + 1e-6
-#     pdf = weights / torch.sum(weights, dim=-1, keepdim=True)
-#     cdf = torch.cumsum(pdf, dim=-1)
-#     cdf = torch.cat([torch.zeros_like(cdf[..., :1]), cdf], dim=-1)
-
-#     if det:
-#         u = torch.linspace(0, 1, N_samples)
-#         u = u.expand(list(cdf.shape[:-1]) + [N_samples])
-#     else:
-#         u = torch.rand(list(cdf.shape[:-1]) + [N_samples])
+def ndc_rays(
+        height: float,
+        width: float,
+        focal: float,
+        near: float,
+        ray_origins: np.ndarray,
+        ray_dirs: np.ndarray):
+    t = -(near + ray_origins[..., 2]) / ray_dirs[..., 2]
+    ray_origins = ray_origins + t[..., None] * ray_dirs
     
-#     u = u.contiguous().to(cdf.device)
+    o0 = -1 / (width / (2 * focal)) * ray_origins[..., 0] / ray_origins[..., 2]
+    o1 = -1 / (height / (2 * focal)) * ray_origins[..., 1] / ray_origins[..., 2]
+    o2 = 1 + 2 * near / ray_origins[..., 2]
 
-#     indicies = torch.searchsorted(cdf, u, right=True)
-#     lower = torch.max(torch.zeros_like(indicies), indicies - 1)
-#     upper = torch.min((cdf.shape[-1] - 1) * torch.ones_like(indicies), indicies)
-#     indicies_g = torch.stack([lower, upper], dim=-1)
-
-#     matched_shape = [indicies_g.shape[0], indicies_g.shape[1], cdf.shape[-1]]
-#     cdf_g = torch.gather(cdf.unsqueeze(1).expand(matched_shape), 2, indicies_g)
-#     bins_g = torch.gather(bins.unsqueeze(1).expand(matched_shape), 2, indicies_g)
+    d0 = -1 / (width / (2 * focal)) * (ray_dirs[..., 0] / ray_dirs[..., 2] - ray_origins[..., 0] / ray_origins[..., 2])
+    d1 = -1 / (height / (2 * focal)) * (ray_dirs[..., 1] / ray_dirs[..., 2] - ray_origins[..., 1] / ray_origins[..., 2])
+    d2 = -2 * near / ray_origins[..., 2]
     
-#     denominator = cdf_g[..., 1] - cdf_g[..., 0]
-#     denominator = torch.where(denominator < 1e-6, torch.ones_like(denominator), denominator)
-#     t = (u - cdf_g[..., 0]) / denominator
-#     samples = bins_g[..., 0] + t * (bins_g[..., 1] - bins_g[..., 0])
-#     return samples
+    ray_origins = np.stack([o0, o1, o2], axis=-1)
+    ray_dirs = np.stack([d0,d1,d2], axis=-1)
+    
+    return ray_origins, ray_dirs

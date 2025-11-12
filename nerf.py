@@ -102,8 +102,9 @@ def nerf_forward(
         num_samples_hierarchical,
         perturb,
         raw_noise_std,
+        lindisp,
         chunk_size=2**18):
-    pts, z_vals = sample_stratified(ray_origins, ray_dirs, near, far, num_samples_stratified, perturb)
+    pts, z_vals = sample_stratified(ray_origins, ray_dirs, near, far, num_samples_stratified, perturb, lindisp)
     dirs = ray_dirs[:, None, ...].expand(pts.shape).reshape((-1, 3))
     pts = pts.reshape((-1, 3))
 
@@ -148,18 +149,20 @@ def train(
         far=6.0,
         num_samples_stratified=64,
         num_samples_hierarchical=128,
-        batch_size=2**12):
+        batch_size=2**12,
+        model_save_name: str="model",
+        lindisp=True):
     device = next(coarse_model.parameters()).device
 
     optimizer = torch.optim.AdamW(
         list(coarse_model.parameters()) + list(fine_model.parameters()),
-        lr=2e-4,
+        lr=5e-4,
         betas=(0.9, 0.98),
     )
     scheduler = torch.optim.lr_scheduler.ExponentialLR(optimizer, gamma=0.1**(1/100_000))
     scaler = torch.amp.GradScaler("cuda")
 
-    itr = 22001
+    itr = 0
     while True:
         rgb, ray_origins, ray_dirs = dataloader.sample(batch_size)
 
@@ -178,7 +181,8 @@ def train(
                 num_samples_stratified,
                 num_samples_hierarchical,
                 True,
-                1
+                1,
+                lindisp
             )
 
         coarse_loss = nn.functional.mse_loss(rgb, rgb_coarse)
@@ -209,7 +213,8 @@ def train(
                 near,
                 far,
                 num_samples_stratified,
-                num_samples_hierarchical
+                num_samples_hierarchical,
+                lindisp
             )
 
             img = img.numpy()
@@ -221,8 +226,8 @@ def train(
             
         
         if itr % 2000 == 0:
-            torch.save(coarse_model.state_dict(), f"./models/lego_coarse_{itr}.pth")
-            torch.save(fine_model.state_dict(), f"./models/lego_fine_{itr}.pth")
+            torch.save(coarse_model.state_dict(), f"./models/{model_save_name}_coarse_{itr}.pth")
+            torch.save(fine_model.state_dict(), f"./models/{model_save_name}_fine_{itr}.pth")
 
         itr += 1
 
@@ -235,6 +240,7 @@ def render_image(
         far,
         num_samples_stratified,
         num_samples_hierarchical,
+        lindisp,
         chunk_size=2**11):
     dims = ray_origins.shape[:2]
     ray_origins = ray_origins.reshape(-1, 3)
@@ -261,7 +267,8 @@ def render_image(
                     num_samples_stratified,
                     num_samples_hierarchical,
                     False,
-                    0
+                    0,
+                    lindisp
                 )
 
                 coarse_chunks.append(rgb_coarse.cpu())
@@ -277,29 +284,34 @@ def render_image(
 if __name__ == "__main__":
     device = "cuda"
 
-    dataset = NeRFDataset(os.path.join("./dataset", "nerf_synthetic", "lego"))
+    # dataset = NeRFDataset(os.path.join("./dataset", "nerf_synthetic", "lego"))
+
+    dataset = NeRFDataset(os.path.join("./dataset", "nerf_llff_data", "fern"))
 
     dataloader = NeRFRayDataLoader(dataset, "train")
 
     coarse_model = NerfModule()
     fine_model = NerfModule()
 
-    coarse_model.load_state_dict(torch.load(f"./models/lego_coarse_42000.pth"))
-    fine_model.load_state_dict(torch.load(f"./models/lego_fine_42000.pth"))
+    # coarse_model.load_state_dict(torch.load(f"./models/lego_coarse_42000.pth"))
+    # fine_model.load_state_dict(torch.load(f"./models/lego_fine_42000.pth"))
 
     coarse_model = coarse_model.to(device)
     fine_model = fine_model.to(device)
 
-    near = 2 / dataloader.dataset.data[dataloader.split]["bound_norm_scale"]
-    far = 6 / dataloader.dataset.data[dataloader.split]["bound_norm_scale"]
-    
+    # near = 2 / dataloader.dataset.data[dataloader.split]["bound_norm_scale"]
+    # far = 6 / dataloader.dataset.data[dataloader.split]["bound_norm_scale"]
 
-    # train(dataloader, coarse_model, fine_model, near, far)
+    near = 0
+    far = 1
+
+    
+    train(dataloader, coarse_model, fine_model, near, far, model_save_name="fern", lindisp=False)
 
 
     while True:
         i = np.random.randint(0, len(dataloader))
-        K, c2w, ray_origins, ray_dirs, img = dataloader.load_image(i, 1/4)
+        K, c2w, ray_origins, ray_dirs, img = dataloader.load_image(i)
 
         rgb_coarse, rgb_fine = render_image(
             coarse_model,
