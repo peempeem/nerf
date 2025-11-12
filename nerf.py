@@ -4,6 +4,7 @@ from dataset import *
 from helpers import *
 
 
+
 class PositionalEncoder(nn.Module):
     def __init__(self, dim_input, num_freqs):
         super().__init__()
@@ -280,12 +281,11 @@ if __name__ == "__main__":
 
     dataloader = NeRFRayDataLoader(dataset, "train")
 
-
     coarse_model = NerfModule()
     fine_model = NerfModule()
 
-    coarse_model.load_state_dict(torch.load(f"./models/lego_coarse_22000.pth"))
-    fine_model.load_state_dict(torch.load(f"./models/lego_fine_22000.pth"))
+    coarse_model.load_state_dict(torch.load(f"./models/lego_coarse_42000.pth"))
+    fine_model.load_state_dict(torch.load(f"./models/lego_fine_42000.pth"))
 
     coarse_model = coarse_model.to(device)
     fine_model = fine_model.to(device)
@@ -294,6 +294,29 @@ if __name__ == "__main__":
     far = 6 / dataloader.dataset.data[dataloader.split]["bound_norm_scale"]
     
 
-    train(dataloader, coarse_model, fine_model, near, far)
-    # show(dataloader, coarse_model, fine_model, 2.0, 6.0, 64, 128)
+    # train(dataloader, coarse_model, fine_model, near, far)
+
+
+    while True:
+        i = np.random.randint(0, len(dataloader))
+        K, c2w, ray_origins, ray_dirs, img = dataloader.load_image(i, 1/4)
+
+        rgb_coarse, rgb_fine = render_image(
+            coarse_model,
+            fine_model,
+            ray_origins,
+            ray_dirs,
+            near,
+            far,
+            128,
+            256,
+            2**13
+        )
+
+        img = img.numpy()
+        rgb_coarse = rgb_coarse.numpy()
+        rgb_fine = rgb_fine.numpy()
+
+        img = (cv2.cvtColor(np.concat([img, rgb_coarse, rgb_fine], axis=1), cv2.COLOR_RGB2BGR) * 255).astype(np.uint8)
+        cv2.imwrite(f"./render.png", img)
 
